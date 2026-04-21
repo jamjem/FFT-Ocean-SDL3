@@ -1,3 +1,42 @@
+# ==============================================================================
+# Visual Studio / C++ project
+# ==============================================================================
+
+# Visual Studio cache/options directory
+.vs/
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio user-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# MSTest/test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+
+# ==============================================================================
+# Compiled / Intermediate files
+# ==============================================================================
+
 # Prerequisites
 *.d
 
@@ -10,6 +49,7 @@
 # Precompiled Headers
 *.gch
 *.pch
+*.ipch
 
 # Compiled Dynamic libraries
 *.so
@@ -30,3 +70,24 @@
 *.exe
 *.out
 *.app
+
+# Linker / debugger output
+*.ilk
+*.map
+*.exp
+*.pdb
+*.idb
+*.tlog
+*.recipe
+*.lastbuildstate
+*.obj.enc
+
+# ==============================================================================
+# OS / Editor
+# ==============================================================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
