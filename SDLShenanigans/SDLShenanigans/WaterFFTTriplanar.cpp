@@ -118,7 +118,7 @@ namespace
         const int N = kFFTSize;
         rgba.assign(N * N * 4, 0u);
 
-        // first pass: dump raw P values into a float buffer + find the max
+        // first pass: dump raw P values into a float buffer and find the max
         std::vector<float> values(N * N, 0.0f);
         float maxP = 0.0f;
         for (int y = 0; y < N; ++y)
@@ -132,7 +132,7 @@ namespace
             }
         }
 
-        // safety valve so we dont divide by zero on a dead spectrum
+        // safety valve to not divide by zero on a dead spectrum
         if (maxP <= 0.0f)
         {
             maxP = 1.0f;
@@ -151,8 +151,7 @@ namespace
 
                 // sqrt compresses the head of the curve, normalize brings it
                 // into 0..1, gamma 0.65 gives it a bit more bite so faint
-                // off-axis waves are still visible. clamp manually because
-                // std::clamp is c++17 and this project is on something older
+                // off-axis waves are still visible. clamp manually because idk I dont have clamp, prob the c++ version
                 float v = std::sqrt(std::max(0.0f, p) * invMax);
                 if (v < 0.0f) { v = 0.0f; }
                 if (v > 1.0f) { v = 1.0f; }
@@ -198,20 +197,20 @@ SDL_AppResult SDL_AppInit(void** appstate, int /*argc*/, char** /*argv*/)
     }
 
     // nearest filter so each spectrum bin stays a sharp square. linear blur
-    // would hide the grid pattern which is the whole point of visualising it
+    // would hide the grid pattern which is the whole point of visualising it rn
     SDL_SetRenderLogicalPresentation(app->renderer, kFFTSize, kFFTSize,
                                      SDL_LOGICAL_PRESENTATION_LETTERBOX);
 
     // wind vector. magnitude = wind speed, direction in the xz plane.
     // slight off-axis tilt just so the result isnt pixel-perfectly axis
-    // aligned, makes the "bowtie" bias more obvious
+    // aligned, makes the butcheeks more obvious
     const mfg::vec2 windRaw(1.0f, 0.28f);
     const mfg::vec2 windDir = mfg::Normalize(windRaw);
 
     BuildPhillipsTexture(app->pixels, windDir, kWindSpeed, kWindPower);
 
     // upload the cpu-side bytes into a gpu-side texture. ABGR8888 in sdl3
-    // matches the R,G,B,A byte order i wrote into the vector above
+    // matches the R,G,B,A byte order i wrote into the vector above. gonna be honest a little lost here
     app->spectrum = SDL_CreateTexture(app->renderer,
                                       SDL_PIXELFORMAT_ABGR8888,
                                       SDL_TEXTUREACCESS_STATIC,
@@ -232,8 +231,8 @@ SDL_AppResult SDL_AppIterate(void* appstate)
 {
     AppState* app = static_cast<AppState*>(appstate);
 
-    // clear to sorta-dark-grey so black bits of the spectrum still read as
-    // "data" not "dead pixel"
+    // clear to sorta dark grey so black bits of the spectrum still read as
+    // data not gone
     SDL_SetRenderDrawColor(app->renderer, 12, 12, 18, 255);
     SDL_RenderClear(app->renderer);
 
@@ -258,8 +257,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event)
         return SDL_APP_SUCCESS;
     }
 
-    // 'S' dumps the spectrum to a BMP so we can pull it into the readme / the
-    // article write-up without screenshotting and cropping by hand
+    // S dumps the spectrum to a BMP 
     if (event->type == SDL_EVENT_KEY_DOWN &&
         event->key.key == SDLK_S &&
         app && !app->pixels.empty())
