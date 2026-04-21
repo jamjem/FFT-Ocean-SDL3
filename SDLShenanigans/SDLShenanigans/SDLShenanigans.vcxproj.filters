@@ -29,5 +29,17 @@
     <None Include="Shaders\fragment.glsl">
       <Filter>Source Files</Filter>
     </None>
+    <None Include="Shaders\initial_spectrum.comp.glsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="Shaders\fullscreen.vert.glsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="Shaders\spectrum_view.frag.glsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="Shaders\compile.bat">
+      <Filter>Source Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

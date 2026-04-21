@@ -133,6 +133,10 @@
   <ItemGroup>
     <None Include="Shaders\fragment.glsl" />
     <None Include="Shaders\vertex.glsl" />
+    <None Include="Shaders\initial_spectrum.comp.glsl" />
+    <None Include="Shaders\fullscreen.vert.glsl" />
+    <None Include="Shaders\spectrum_view.frag.glsl" />
+    <None Include="Shaders\compile.bat" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\..\..\SDL\VisualC\SDL\SDL.vcxproj">

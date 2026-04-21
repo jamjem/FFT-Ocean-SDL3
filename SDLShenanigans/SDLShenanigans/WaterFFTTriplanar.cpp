@@ -2,10 +2,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
-#include <cstdio>
+#include <random>
 #include <vector>
 #include "mfg.hpp"
 
@@ -17,273 +15,356 @@ namespace
         ===================================================================
         WHAT THIS SHIT DO
         ===================================================================
-        a wave has:
-             a direction 
-             a frequency 
-        slap those with a vector in frequency space
-            k = wdirection * wfrequency
+        step 1 is the phillips spectrum:
 
-        for every one of those k vectors, the phillips spectrum tells us how
-        much amplitude that wave gets
+            P(k) = A * exp(-1/(k*L)^2) / k^4 * |k_hat . w_hat|^p
 
-            P(k) = A * exp(-1/(k*L)^2) / k^4 * |k_hat . w_hat|^2
+            the dot between k_hat and w_hat biases energy toward waves
+        travelling with the wind, raising it to p tightens the cone.
 
-        the dot between k_hat and w_hat biases energy toward waves travelling
-        with the wind and kills waves going sideways to the wind. raising it
-        to a power tightens the cone.
+            but P(k) is deterministic. IFFT it and every patch of ocean
+        looks identical, stamped out like a cookie cutter. real water
+        has randomness at every wavevector. step 2 (tessendorf) fixes
+        that by multiplying by a complex gaussian:
+
+            h0(k) = (1/sqrt(2)) * sqrt(P(k)) * (xi_r + i * xi_i)
+            
+        step 2 gpu and gaussian noise added:
+
+            everything that was CPU in step 1 has now moved to the gpu:
+        cpu generates the gaussian noise once (box-muller via
+        std::normal_distribution) and uploads it as an RG32F texture
+        one compute dispatch evaluates P(k), reads the noise,
+        multiplies them together, and writes h0(k) into an RG32F
+        storage texture
+        a fullscreen triangle samples h0 and draws it to the window
+        with a fftshift so k=0 sits in the middle
 
         settings Barthélémy Paleologue used:
             A = 1.0            amplitude
             L = 1000 m         ocean tile size
             |w| = 31 m/s       wind speed
-            resolution = 256   N in the NxN frequency grid
-
-        that spits out a 256x256 texture that encodes the spectrum amplitude.
-        put that into an sdl texture and draw it to the window. YIPPEEE
+            p = 6              wind directionality (his showy screenshot)
+            N = 256            N in the NxN frequency grid
+        YIPPEEE
     */
 
-    constexpr float    kPi          = 3.14159265359f;
+  // ==========================================================================
+  // Simulation Shtuff
+  // ==========================================================================
+	constexpr int      kN = 256;              // N in the NxN frequency grid
+    constexpr float    kPatch      = 1000.0f;// L, meters
+    constexpr float    kAmp        = 1.0f;  // Amplitude
+    constexpr float    kWindSpeed  = 31.0f;// |w|, m/s
+    constexpr float    kWindPower  = 6.0f;// p on |k_hat . w_hat|
+    constexpr float    kGravity    = 9.81f;
+    constexpr int      kWindow     = 768;
+    constexpr uint64_t kNoiseSeed  = 0xC05DC0FFEE5EEDEDull;
 
-	// the settings for the phillips spectrum.
-    constexpr int      kFFTSize     = 256;     // N
-    constexpr float    kPatchLength = 1000.0f; // L, in meters
-    constexpr float    kPhillipsAmp = 1.0f;    // Amplitude
-    constexpr float    kWindSpeed   = 31.0f;   // w in m/s
-    constexpr float    kWindPower   = 2.0f;    // p on |k_hat . w_hat|^p (classic phillips = 2)
-    constexpr float    kGravity     = 9.81f;   // g, needed by the max wavelength L_wave = V^2/g
-
-    constexpr int      kWindowSize  = 768;
-
-    // fft bins run 0..N-1 but wave vectors need to be centered on 0. anything
-    // past N/2 wraps into negative land. then multiply by 2*pi/L to get the
-    // physical k in radians per meter. returning a vec2 from the glorius mfg library so phillips can just dot/magnitude it directly
-    static mfg::vec2 KVector(int x, int y, int n, float patchLength)
+    //  uniform block handed to initial_spectrum.comp.glsl. byte layout has
+    // to match std140 exactly, int and float align to 4, vec2 aligns to 8,
+    // and the block ends up rounded to a multiple of 16.
+    struct Params
     {
-        const int mx = (x <= (n / 2)) ? x : (x - n);
-        const int my = (y <= (n / 2)) ? y : (y - n);
-        const float scale = (2.0f * kPi) / patchLength;
-        return mfg::vec2(static_cast<float>(mx) * scale,
-                         static_cast<float>(my) * scale);
-    }
+        int32_t N;            // 0
+        float   patchLength;  // 4
+        float   amplitude;    // 8
+        float   windSpeed;    // 12
+        float   windX;        // 16  start of vec2 u_windDir (aligns to 8)
+        float   windY;        // 20
+        float   windPower;    // 24
+        float   gravity;      // 28
+    };
+    static_assert(sizeof(Params) == 32, "Params must match std140");
 
-    // phillips spectrum, step one for making the oceans heightmap
-	//   P(k) = A * exp(-1/(kL)^2) / k^4 * |k_hat . w_hat|^p   (this is the formula from barth)
-    //
-    // the 1/k^4 term pumps energy into long waves, the exp(-1/(kL)^2) kills
-    // anything bigger than the patch, and |k_hat . w_hat|^p is the wind
-    // alignment factor that makes the ocean look wind-driven instead of
-    // a uniform chop in every direction.
-    static float Phillips(const mfg::vec2& k,
-                          const mfg::vec2& windDir,
-                          float windSpeed,
-                          float windPower)
+    //destroying everything at the end is this in reverse
+    struct App
     {
-        const float kLen = mfg::Magnitude(k);
-        if (kLen < 1e-6f)
-        {
-            return 0.0f;
-        }
-        const float k2 = kLen * kLen;
-        const float k4 = k2 * k2;
-
-        // L_wave = V^2/g is the biggest wave the wind can whip up under deep
-        // water dispersion. This is NOT kPatchLength (the tile size).
-        const float L  = (windSpeed * windSpeed) / kGravity;
-        const float L2 = L * L;
-
-        // k_hat . w_hat, abs'd, raised to p. assumes windDir is already unit
-        // length (we normalize it once up in main, so thats fine) what a stupid set of made up words
-        const mfg::vec2 kHat = k / kLen;
-        const float kDotW = mfg::Dot(kHat, windDir);
-        const float alignment = std::pow(std::fabs(kDotW), windPower);
-
-        const float expLarge = std::exp(-1.0f / (k2 * L2));
-        return kPhillipsAmp * (expLarge / k4) * alignment;
-    }
-
-    // build a 256x256 grayscale texture. each pixel =
-    // one bin in the frequency grid, value = phillips amplitude at that k.
-    //
-    // phillips has absurd dynamic range (the 1/k^4 term) so I cant just
-    // dump P(k) into a byte and call it a day. ergo solutions:
-    //   - take sqrt to compress the scale
-    //   - then normalize against the max across the whole texture
-    //   - throw a mild gamma on for looking cool
-    // output is fftshifted: the k=0 bin lands at the center of the image so a wind-aligned butcheek shows up. 
-    static void BuildPhillipsTexture(std::vector<uint8_t>& rgba,
-                                     const mfg::vec2& wind,
-                                     float windSpeed,
-                                     float windPower)
-    {
-        const int N = kFFTSize;
-        rgba.assign(N * N * 4, 0u);
-
-        // first pass: dump raw P values into a float buffer and find the max
-        std::vector<float> values(N * N, 0.0f);
-        float maxP = 0.0f;
-        for (int y = 0; y < N; ++y)
-        {
-            for (int x = 0; x < N; ++x)
-            {
-                const mfg::vec2 k = KVector(x, y, N, kPatchLength);
-                const float p = Phillips(k, wind, windSpeed, windPower);
-                values[y * N + x] = p;
-                if (p > maxP) { maxP = p; }
-            }
-        }
-
-        // safety valve to not divide by zero on a dead spectrum
-        if (maxP <= 0.0f)
-        {
-            maxP = 1.0f;
-        }
-
-        // second pass: fftshift + sqrt/normalize/gamma into an 8-bit grayscale
-        const float invMax = 1.0f / maxP;
-        for (int y = 0; y < N; ++y)
-        {
-            for (int x = 0; x < N; ++x)
-            {
-                // fftshift: swap halves so k=(0,0) ends up in the middle
-                const int sx = (x + N / 2) % N;
-                const int sy = (y + N / 2) % N;
-                const float p = values[sy * N + sx];
-
-                // sqrt compresses the head of the curve, normalize brings it
-                // into 0..1, gamma 0.65 gives it a bit more bite so faint
-                // off-axis waves are still visible. clamp manually because idk I dont have clamp, prob the c++ version
-                float v = std::sqrt(std::max(0.0f, p) * invMax);
-                if (v < 0.0f) { v = 0.0f; }
-                if (v > 1.0f) { v = 1.0f; }
-                v = std::pow(v, 0.65f);
-
-                const uint8_t byte = static_cast<uint8_t>(v * 255.0f + 0.5f);
-                const int idx = (y * N + x) * 4;
-                rgba[idx + 0] = byte;
-                rgba[idx + 1] = byte;
-                rgba[idx + 2] = byte;
-                rgba[idx + 3] = 255u;
-            }
-        }
-    }
-
-    struct AppState
-    {
-        SDL_Window*   window   = nullptr;
-        SDL_Renderer* renderer = nullptr;
-        SDL_Texture*  spectrum = nullptr;
-		std::vector<uint8_t> pixels; //might wanna get rid of this after we upload to the gpu, it small but liek
+        SDL_Window*              window = nullptr;
+        SDL_GPUDevice*           device = nullptr;
+        SDL_GPUComputePipeline*  compute = nullptr;  // phillips * noise = h0
+        SDL_GPUGraphicsPipeline* draw = nullptr;     // fullscreen tringle + view frag
+        SDL_GPUTexture*          noise = nullptr;    // RG32F, the cpu gaussians
+        SDL_GPUTexture*          h0 = nullptr;       // RG32F, h0(k)
+        SDL_GPUSampler*          sampler = nullptr;  // nearest/repeat for both
     };
 }
 
+// =================================================================================
+// SDL_AppInit - create gpu device, the pipelines, upload noise, run compute shaders
+// =================================================================================
 SDL_AppResult SDL_AppInit(void** appstate, int /*argc*/, char** /*argv*/)
 {
     if (!SDL_Init(SDL_INIT_VIDEO))
     {
-        SDL_Log("SDL_Init failed: %s", SDL_GetError());
+        SDL_Log("SDL_Init: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
 
-    AppState* app = new AppState();
+    App* app = new App();
     *appstate = app;
 
-    // ask for the window + renderer in one call cuz sdl is baller
-    if (!SDL_CreateWindowAndRenderer("Let there be light",
-                                     kWindowSize, kWindowSize, 0,
-                                     &app->window, &app->renderer))
+    // window + gpu device + hook them together
+    app->window = SDL_CreateWindow("TOO MUCH LIGHT", kWindow, kWindow, SDL_WINDOW_RESIZABLE);
+    app->device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, true, nullptr);
+    if (!app->window || !app->device ||
+        !SDL_ClaimWindowForGPUDevice(app->device, app->window))
     {
-        SDL_Log("SDL_CreateWindowAndRenderer failed: %s", SDL_GetError());
+        SDL_Log("gpu init: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
 
-    // nearest filter so each spectrum bin stays a sharp square. linear blur
-    // would hide the grid pattern which is the whole point of visualising it rn
-    SDL_SetRenderLogicalPresentation(app->renderer, kFFTSize, kFFTSize,
-                                     SDL_LOGICAL_PRESENTATION_LETTERBOX);
-
-    // wind vector. magnitude = wind speed, direction in the xz plane.
-    // slight off-axis tilt just so the result isnt pixel-perfectly axis
-    // aligned, makes the butcheeks more obvious
-    const mfg::vec2 windRaw(1.0f, 0.28f);
-    const mfg::vec2 windDir = mfg::Normalize(windRaw);
-
-    BuildPhillipsTexture(app->pixels, windDir, kWindSpeed, kWindPower);
-
-    // upload the cpu-side bytes into a gpu-side texture. ABGR8888 in sdl3
-    // matches the R,G,B,A byte order i wrote into the vector above. gonna be honest a little lost here
-    app->spectrum = SDL_CreateTexture(app->renderer,
-                                      SDL_PIXELFORMAT_ABGR8888,
-                                      SDL_TEXTUREACCESS_STATIC,
-                                      kFFTSize, kFFTSize);
-    if (!app->spectrum)
+    // compute pipeline
+    // initial_spectrum.comp.glsl has these bindings
+    //     set=0 binding=0  sampler2D u_noise   (read the cpu gaussians)
+    //     set=1 binding=0  image2D   u_h0      (write the complex spectrum)
+    //     set=2 binding=0  uniform   Params    (push constants in practice)
     {
-        SDL_Log("SDL_CreateTexture failed: %s", SDL_GetError());
+        size_t sz = 0;
+        void*  code = SDL_LoadFile("Shaders/initial_spectrum.comp.spv", &sz);
+        if (!code) { SDL_Log("initial_spectrum.comp.spv: %s", SDL_GetError()); return SDL_APP_FAILURE; }
+
+        SDL_GPUComputePipelineCreateInfo ci{};
+        ci.code = static_cast<const Uint8*>(code);
+        ci.code_size = sz;
+        ci.entrypoint = "main";
+        ci.format = SDL_GPU_SHADERFORMAT_SPIRV;
+        ci.num_samplers = 1;
+        ci.num_readwrite_storage_textures = 1;
+        ci.num_uniform_buffers  = 1;
+        ci.threadcount_x = 8;
+        ci.threadcount_y = 8;
+        ci.threadcount_z = 1;
+        app->compute = SDL_CreateGPUComputePipeline(app->device, &ci);
+        SDL_free(code);
+        if (!app->compute) { SDL_Log("compute pipeline: %s", SDL_GetError()); return SDL_APP_FAILURE; }
+    }
+
+    // graphics pipeline
+    // vertex shader takes nothing, fragment samples h0 at set=2 binding=0
+    auto LoadShader = [&](const char* path, SDL_GPUShaderStage stage, Uint32 samplers) -> SDL_GPUShader*
+    {
+        size_t sz = 0;
+        void*  code = SDL_LoadFile(path, &sz);
+        if (!code) { SDL_Log("%s: %s", path, SDL_GetError()); return nullptr; }
+
+        SDL_GPUShaderCreateInfo ci{};
+        ci.code = static_cast<const Uint8*>(code);
+        ci.code_size = sz;
+        ci.entrypoint = "main";
+        ci.format = SDL_GPU_SHADERFORMAT_SPIRV;
+        ci.stage = stage;
+        ci.num_samplers = samplers;
+
+        SDL_GPUShader* s = SDL_CreateGPUShader(app->device, &ci);
+        SDL_free(code);
+        return s;
+    };
+
+    SDL_GPUShader* vs = LoadShader("Shaders/fullscreen.vert.spv",    SDL_GPU_SHADERSTAGE_VERTEX,   0);
+    SDL_GPUShader* fs = LoadShader("Shaders/spectrum_view.frag.spv", SDL_GPU_SHADERSTAGE_FRAGMENT, 1);
+    if (!vs || !fs) { return SDL_APP_FAILURE; }
+
+    SDL_GPUColorTargetDescription colorTarget{};
+    colorTarget.format = SDL_GetGPUSwapchainTextureFormat(app->device, app->window);
+
+    SDL_GPUGraphicsPipelineCreateInfo gpci{};
+    gpci.vertex_shader = vs;
+    gpci.fragment_shader = fs;
+    gpci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    gpci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+    gpci.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+    gpci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    gpci.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    gpci.target_info.num_color_targets = 1;
+    gpci.target_info.color_target_descriptions = &colorTarget;
+
+    app->draw = SDL_CreateGPUGraphicsPipeline(app->device, &gpci);
+    // pipeline keeps its own reference to the shaders
+    SDL_ReleaseGPUShader(app->device, vs);
+    SDL_ReleaseGPUShader(app->device, fs);
+    if (!app->draw) { SDL_Log("graphics pipeline: %s", SDL_GetError()); return SDL_APP_FAILURE; }
+
+    // noise + h0 textures
+    // both are NxN 2-channel floats. noise is read-only (SAMPLER), h0 is
+    // both written by compute (COMPUTE_STORAGE_WRITE) and sampled by the
+    // fragment shader (SAMPLER).
+    SDL_GPUTextureCreateInfo tci{};
+    tci.type = SDL_GPU_TEXTURETYPE_2D;
+    tci.format = SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT;
+    tci.width = kN;
+    tci.height = kN;
+    tci.layer_count_or_depth = 1;
+    tci.num_levels = 1;
+
+    tci.usage  = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    app->noise = SDL_CreateGPUTexture(app->device, &tci);
+
+    tci.usage  = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE;
+    app->h0    = SDL_CreateGPUTexture(app->device, &tci);
+
+    // nearest filter so each spectrum bin stays a sharp square when the
+    // window is larger than N. linear would blur the grid pattern which
+    // is exactly what we want to see while debugging.
+    SDL_GPUSamplerCreateInfo sci{};
+    sci.min_filter = SDL_GPU_FILTER_NEAREST;
+    sci.mag_filter = SDL_GPU_FILTER_NEAREST;
+    sci.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    sci.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    sci.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    sci.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    app->sampler = SDL_CreateGPUSampler(app->device, &sci);
+
+    if (!app->noise || !app->h0 || !app->sampler)
+    {
+        SDL_Log("texture/sampler creation: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
-    SDL_SetTextureScaleMode(app->spectrum, SDL_SCALEMODE_NEAREST);
-    SDL_UpdateTexture(app->spectrum, nullptr, app->pixels.data(),
-                      kFFTSize * 4);
+
+    // fill then upload the gaussian noise
+    // standard normals for both real and imaginary parts. marsaglia polar
+    // same distribution barth's gpu box-muller produces apparently.
+    std::vector<float> noisePixels(static_cast<size_t>(kN) * kN * 2);
+    {
+        std::mt19937_64 rng(kNoiseSeed);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        for (float& f : noisePixels) { f = dist(rng); }
+    }
+
+    SDL_GPUTransferBufferCreateInfo tbci{};
+    tbci.size  = static_cast<Uint32>(noisePixels.size() * sizeof(float));
+    tbci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(app->device, &tbci);
+
+    // map -> memcpy -> unmap. SDL will keep the staging buffer alive until the copy pass finishes on the gpu
+    void* mapped = SDL_MapGPUTransferBuffer(app->device, tb, false);
+    SDL_memcpy(mapped, noisePixels.data(), tbci.size);
+    SDL_UnmapGPUTransferBuffer(app->device, tb);
+
+    SDL_GPUCommandBuffer* uploadCmd = SDL_AcquireGPUCommandBuffer(app->device);
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(uploadCmd);
+    SDL_GPUTextureTransferInfo src{};
+    src.transfer_buffer = tb;
+    src.pixels_per_row = kN;
+    src.rows_per_layer = kN;
+    SDL_GPUTextureRegion region{};
+    region.texture = app->noise;
+    region.w = kN; region.h = kN; region.d = 1;
+    SDL_UploadToGPUTexture(copyPass, &src, &region, false);
+    SDL_EndGPUCopyPass(copyPass);
+    SDL_SubmitGPUCommandBuffer(uploadCmd);
+    SDL_ReleaseGPUTransferBuffer(app->device, tb);
+
+    // dispatch the compute exactly once
+    // h0(k) is static in step 2 - the time evolution that re-runs the
+    // spectrum every frame is a future me problem.
+    SDL_GPUCommandBuffer* computeCmd = SDL_AcquireGPUCommandBuffer(app->device);
+
+    SDL_GPUStorageTextureReadWriteBinding rw{};
+    rw.texture = app->h0;
+    SDL_GPUComputePass* cpass = SDL_BeginGPUComputePass(computeCmd, &rw, 1, nullptr, 0);
+
+    SDL_BindGPUComputePipeline(cpass, app->compute);
+
+    SDL_GPUTextureSamplerBinding noiseBinding{};
+    noiseBinding.texture = app->noise;
+    noiseBinding.sampler = app->sampler;
+    SDL_BindGPUComputeSamplers(cpass, 0, &noiseBinding, 1);
+
+    // slight off-axis tilt so the wind-alignment shape isn't pixel-locked
+    // to a row/column. normalising in the holy mfg library is cheap and happens
+    // once, the shader assumes it's already unit length.
+    const mfg::vec2 windDir = mfg::Normalize(mfg::vec2(1.0f, 0.28f));
+    Params p{};
+    p.N = kN;
+    p.patchLength = kPatch;
+    p.amplitude = kAmp;
+    p.windSpeed = kWindSpeed;
+    p.windX = windDir.x();
+    p.windY = windDir.y();
+    p.windPower = kWindPower;
+    p.gravity = kGravity;
+    SDL_PushGPUComputeUniformData(computeCmd, 0, &p, sizeof(p));
+
+    // ceil(N/8) groups in each dim; the shader guards against overshoot.
+    SDL_DispatchGPUCompute(cpass, (kN + 7) / 8, (kN + 7) / 8, 1);
+    SDL_EndGPUComputePass(cpass);
+    SDL_SubmitGPUCommandBuffer(computeCmd);
 
     return SDL_APP_CONTINUE;
 }
 
+// ==========================================================================
+// SDL_AppIterate - frame by frame rendering
+// ==========================================================================
 SDL_AppResult SDL_AppIterate(void* appstate)
 {
-    AppState* app = static_cast<AppState*>(appstate);
+    App* app = static_cast<App*>(appstate);
 
-    // clear to sorta dark grey so black bits of the spectrum still read as
-    // data not gone
-    SDL_SetRenderDrawColor(app->renderer, 12, 12, 18, 255);
-    SDL_RenderClear(app->renderer);
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(app->device);
 
-    // logical presentation is already kFFTSize x kFFTSize so drawing the
-    // texture at its natural size fills the logical surface
-    SDL_FRect dst{ 0.0f, 0.0f,
-                   static_cast<float>(kFFTSize),
-                   static_cast<float>(kFFTSize) };
-    SDL_RenderTexture(app->renderer, app->spectrum, nullptr, &dst);
+    // swapchain texture might come back null if the window is minimised or
+    // mid-resize. submit the (empty) command buffer anyway to keep sdl happy and try again next tick.
+    SDL_GPUTexture* swap = nullptr;
+    Uint32 w = 0, h = 0;
+    if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, app->window, &swap, &w, &h) || !swap)
+    {
+        SDL_SubmitGPUCommandBuffer(cmd);
+        return SDL_APP_CONTINUE;
+    }
 
-    SDL_RenderPresent(app->renderer);
+    SDL_GPUColorTargetInfo ct{};
+    ct.texture     = swap;
+    ct.clear_color = { 12 / 255.0f, 12 / 255.0f, 18 / 255.0f, 1.0f };
+    ct.load_op     = SDL_GPU_LOADOP_CLEAR;
+    ct.store_op    = SDL_GPU_STOREOP_STORE;
+
+    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &ct, 1, nullptr);
+    SDL_BindGPUGraphicsPipeline(pass, app->draw);
+
+    SDL_GPUTextureSamplerBinding h0Binding{};
+    h0Binding.texture = app->h0;
+    h0Binding.sampler = app->sampler;
+    SDL_BindGPUFragmentSamplers(pass, 0, &h0Binding, 1);
+
+    // fullscreen.vert assembles the triangle from gl_VertexIndex alone 
+    SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+    SDL_EndGPURenderPass(pass);
+    SDL_SubmitGPUCommandBuffer(cmd);
     return SDL_APP_CONTINUE;
 }
 
-SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event)
+// ==========================================================================
+// SDL_AppEvent
+// ==========================================================================
+SDL_AppResult SDL_AppEvent(void* /*appstate*/, SDL_Event* event)
 {
-    AppState* app = static_cast<AppState*>(appstate);
-
     if (event->type == SDL_EVENT_QUIT ||
         event->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)
     {
         return SDL_APP_SUCCESS;
     }
-
-    // S dumps the spectrum to a BMP 
-    if (event->type == SDL_EVENT_KEY_DOWN &&
-        event->key.key == SDLK_S &&
-        app && !app->pixels.empty())
-    {
-        SDL_Surface* surf = SDL_CreateSurfaceFrom(kFFTSize, kFFTSize,
-                                                  SDL_PIXELFORMAT_ABGR8888,
-                                                  app->pixels.data(),
-                                                  kFFTSize * 4);
-        if (surf)
-        {
-            SDL_SaveBMP(surf, "phillips_spectrum.bmp");
-            SDL_DestroySurface(surf);
-            SDL_Log("saved phillips_spectrum.bmp");
-        }
-    }
-
     return SDL_APP_CONTINUE;
 }
 
+// ==========================================================================
+// BURN IT ALL TO THE GROUND SDL_AppQuit
+// ==========================================================================
 void SDL_AppQuit(void* appstate, SDL_AppResult /*result*/)
 {
-    AppState* app = static_cast<AppState*>(appstate);
+    App* app = static_cast<App*>(appstate);
     if (!app) { return; }
 
-    if (app->spectrum) { SDL_DestroyTexture(app->spectrum); }
-    if (app->renderer) { SDL_DestroyRenderer(app->renderer); }
-    if (app->window)   { SDL_DestroyWindow(app->window); }
+    if (app->device)
+    {
+        if (app->draw)    { SDL_ReleaseGPUGraphicsPipeline(app->device, app->draw); }
+        if (app->compute) { SDL_ReleaseGPUComputePipeline(app->device, app->compute); }
+        if (app->sampler) { SDL_ReleaseGPUSampler(app->device, app->sampler); }
+        if (app->h0)      { SDL_ReleaseGPUTexture(app->device, app->h0); }
+        if (app->noise)   { SDL_ReleaseGPUTexture(app->device, app->noise); }
+        if (app->window)  { SDL_ReleaseWindowFromGPUDevice(app->device, app->window); }
+        SDL_DestroyGPUDevice(app->device);
+    }
+    if (app->window) { SDL_DestroyWindow(app->window); }
     delete app;
 }
