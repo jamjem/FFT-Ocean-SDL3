@@ -9,9 +9,14 @@
 
         h0(k) = (1/sqrt(2)) * sqrt(P(k)) * (xi_r + i * xi_i)
 
-    dispatched once during init. writes rg of the output image.
-    ba are left at zero - step 3 will pack the conjugate h0(-k)* in
-    there for the time-evolution pass, but we don't need it yet.
+    step 3 needs both h0(k) AND h0(-k)* at every bin for the time
+    evolution formula, so i pre-pack the conjugate into the same
+    texel while i'm already in the neighborhood:
+
+        output.rg = h0(k)          (the wave travelling with +k)
+        output.ba = h0(-k)*        (conjugate of its opposite twin)
+
+    dispatched exactly once during init.
 */
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -19,8 +24,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // cpu-side gaussian noise, one N(0,1) per channel
 layout(set = 0, binding = 0) uniform sampler2D u_noise;
 
-// output: h0 in rg
-layout(set = 1, binding = 0, rg32f) uniform writeonly image2D u_h0;
+// RGBA32F: (h0.rg, h0(-k)*.ba)
+layout(set = 1, binding = 0, rgba32f) uniform writeonly image2D u_h0;
 
 // must match the Params struct on the cpu side byte-for-byte (std140)
 layout(set = 2, binding = 0) uniform Params
@@ -44,13 +49,20 @@ vec2 kVector(ivec2 bin)
     return vec2(m) * (6.28318530717958647692 / u_patchLength);
 }
 
-// phillips spectrum, same formula from step 1:
-//     P(k) = A * exp(-1/(k*L_wave)^2) / k^4 * |k_hat . w_hat|^p
+// phillips spectrum:
+//     P(k) = A * exp(-1/(k*L)^2) / k^4 * |k_hat . w_hat|^p
 //
-// 1/k^4 pumps energy into long waves, exp(-1/(k*L_wave)^2) kills the
-// too-long ones, |k_hat . w_hat|^p is the wind-alignment factor.
-// L_wave = V^2 / g is the biggest wave the wind can whip up, NOT the
-// patch size. subtle and easy to screw up.
+// 1/k^4 pumps energy into long waves, exp(-1/(k*L)^2) kills ones
+// longer than L, |k_hat . w_hat|^p is the wind-alignment factor.
+//
+// a note on L: tessendorf's paper defines L = V^2 / g (the biggest
+// wave the wind could physically create). barth's blog post uses
+// L = the ocean tile size (1000m for me). with tile-size L the exp
+// factor is ~1 everywhere and the spectrum is basically just
+// 1/k^4 * align, which gives the big fat butterfly in his reference
+// screenshots. using V^2/g gives a smaller, more physically-honest
+// butterfly but doesn't match the visual i'm trying to reproduce.
+// i pick barth's interpretation so the output lines up with his.
 float phillips(vec2 k)
 {
     float kLen = length(k);
@@ -59,7 +71,7 @@ float phillips(vec2 k)
     float k2 = kLen * kLen;
     float k4 = k2 * k2;
 
-    float L  = (u_windSpeed * u_windSpeed) / u_gravity;
+    float L  = u_patchLength;
     float L2 = L * L;
 
     // abs'd and raised to p. assumes u_windDir is a unit vector.
@@ -73,14 +85,26 @@ void main()
     ivec2 id = ivec2(gl_GlobalInvocationID.xy);
     if (id.x >= u_N || id.y >= u_N) { return; }
 
-    vec2  k  = kVector(id);
-    float P  = phillips(k);
-    vec2  xi = texelFetch(u_noise, id, 0).rg;
+    vec2  k = kVector(id);
+    float P = phillips(k);
 
-    // P(k) is variance, sqrt(P) turns it back into amplitude.
-    // the 1/sqrt(2) is tessendorf's normalisation.
+    // the "-k" bin mirrors the current bin through the origin. the
+    // modulo handles id=(0,0) wrapping back to itself (harmless,
+    // P(0)=0 anyway) and keeps the N/2 nyquist row self-consistent.
+    ivec2 negId = ivec2((u_N - id.x) % u_N,
+                        (u_N - id.y) % u_N);
+
+    vec2 xiPos = texelFetch(u_noise, id,    0).rg;
+    vec2 xiNeg = texelFetch(u_noise, negId, 0).rg;
+
+    // P(k) is variance, sqrt(P) gives amplitude. the 1/sqrt(2) is
+    // tessendorf's normalisation. phillips is even: P(-k) = P(k),
+    // so i only need one sqrt.
     const float INV_SQRT2 = 0.70710678118654752440;
-    vec2 h0 = INV_SQRT2 * sqrt(max(P, 0.0)) * xi;
+    float amp = INV_SQRT2 * sqrt(max(P, 0.0));
 
-    imageStore(u_h0, id, vec4(h0, 0.0, 0.0));
+    vec2 h0Pos     = amp * xiPos;
+    vec2 h0NegConj = amp * vec2(xiNeg.x, -xiNeg.y);   // conjugate(h0(-k))
+
+    imageStore(u_h0, id, vec4(h0Pos, h0NegConj));
 }

@@ -3,8 +3,13 @@
 :: assumes glslc is on PATH (comes with the Vulkan SDK).
 pushd %~dp0
 glslc -fshader-stage=compute  initial_spectrum.comp.glsl -o initial_spectrum.comp.spv || goto :fail
+glslc -fshader-stage=compute  time_spectrum.comp.glsl    -o time_spectrum.comp.spv    || goto :fail
+glslc -fshader-stage=compute  fft_stockham.comp.glsl     -o fft_stockham.comp.spv     || goto :fail
+glslc -fshader-stage=compute  fft_stockham2.comp.glsl    -o fft_stockham2.comp.spv    || goto :fail
 glslc -fshader-stage=vertex   fullscreen.vert.glsl       -o fullscreen.vert.spv       || goto :fail
 glslc -fshader-stage=fragment spectrum_view.frag.glsl    -o spectrum_view.frag.spv    || goto :fail
+glslc -fshader-stage=fragment heightmap_view.frag.glsl   -o heightmap_view.frag.spv   || goto :fail
+glslc -fshader-stage=fragment gradient_view.frag.glsl    -o gradient_view.frag.spv    || goto :fail
 echo all shaders compiled
 popd & exit /b 0
 :fail

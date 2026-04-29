@@ -127,15 +127,19 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="IterativeStockhamFFT.cpp" />
     <ClCompile Include="SDLShenanigans.cpp" />
     <ClCompile Include="WaterFFTTriplanar.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="Shaders\fragment.glsl" />
-    <None Include="Shaders\vertex.glsl" />
     <None Include="Shaders\initial_spectrum.comp.glsl" />
+    <None Include="Shaders\time_spectrum.comp.glsl" />
+    <None Include="Shaders\fft_stockham.comp.glsl" />
+    <None Include="Shaders\fft_stockham2.comp.glsl" />
     <None Include="Shaders\fullscreen.vert.glsl" />
     <None Include="Shaders\spectrum_view.frag.glsl" />
+    <None Include="Shaders\heightmap_view.frag.glsl" />
+    <None Include="Shaders\gradient_view.frag.glsl" />
     <None Include="Shaders\compile.bat" />
   </ItemGroup>
   <ItemGroup>

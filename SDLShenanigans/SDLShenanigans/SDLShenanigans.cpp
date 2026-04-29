@@ -134,7 +134,7 @@
 //    // create the pipeline
 //    graphicsPipeline = SDL_CreateGPUGraphicsPipeline(device, &pipelineInfo);
 //
-//    // we don't need to store the shaders after creating the pipeline
+//    // i don't need to store the shaders after creating the pipeline
 //    SDL_ReleaseGPUShader(device, vertexShader);
 //    SDL_ReleaseGPUShader(device, fragmentShader);
 //

@@ -21,21 +21,33 @@
     <ClCompile Include="WaterFFTTriplanar.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="IterativeStockhamFFT.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="Shaders\vertex.glsl">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="Shaders\fragment.glsl">
-      <Filter>Source Files</Filter>
-    </None>
     <None Include="Shaders\initial_spectrum.comp.glsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="Shaders\time_spectrum.comp.glsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="Shaders\fft_stockham.comp.glsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="Shaders\fft_stockham2.comp.glsl">
       <Filter>Source Files</Filter>
     </None>
     <None Include="Shaders\fullscreen.vert.glsl">
       <Filter>Source Files</Filter>
     </None>
     <None Include="Shaders\spectrum_view.frag.glsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="Shaders\heightmap_view.frag.glsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="Shaders\gradient_view.frag.glsl">
       <Filter>Source Files</Filter>
     </None>
     <None Include="Shaders\compile.bat">
